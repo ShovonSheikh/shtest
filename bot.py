@@ -623,11 +623,17 @@ async def ping_cmd(interaction: discord.Interaction, target: str = "8.8.8.8"):
         return
     
     try:
-        # Detect OS and use appropriate ping command
-        param = '-n' if platform.system().lower() == 'windows' else '-c'
-        args = ['ping', param, '4', target]
-
         await interaction.response.defer()
+        
+        # Detect OS and use appropriate ping command with full path
+        system = platform.system().lower()
+        if system == 'windows':
+            ping_exe = 'C:\\Windows\\System32\\ping.exe'
+            args = [ping_exe, '-n', '4', target]
+        else:
+            # On Linux/macOS, ping is usually in PATH
+            args = ['ping', '-c', '4', target]
+        
         proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
