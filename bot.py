@@ -14,8 +14,11 @@ from datetime import datetime
 from typing import Optional
 import json
 import sys
+from aiohttp import web
+import threading
 
 # ======================== CONFIGURATION ========================
+# Hardcoded for testing - move to .env for production
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 JSONBIN_API_KEY = os.getenv('JSONBIN_API_KEY')  # Get from jsonbin.io
 JSONBIN_BIN_ID = os.getenv('JSONBIN_BIN_ID')
@@ -133,7 +136,7 @@ class RBACSystem:
 
 # ======================== BOT SETUP ========================
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True  # Only enable message content intent
 
 bot = commands.Bot(command_prefix='/', intents=intents)
 storage = JSONBinStorage(JSONBIN_API_KEY, JSONBIN_BIN_ID)
@@ -172,6 +175,10 @@ def requires_permission(role='readonly'):
 async def on_ready():
     print(f'✅ Bot logged in as {bot.user}')
     print(f'📊 Loaded {len(rbac.users)} user records')
+    
+    # Start web server
+    asyncio.create_task(start_webserver())
+    
     try:
         synced = await bot.tree.sync()
         print(f'✅ Synced {len(synced)} commands')
@@ -650,6 +657,24 @@ async def log_cmd(interaction: discord.Interaction, lines: int = 20):
     
     await interaction.response.send_message(f"📋 **Last {lines} log entries:**\n```\nCheck your console/terminal for logs\n```")
     log_command(str(interaction.user), f"log {lines}", "SUCCESS")
+
+# ======================== WEB SERVER ========================
+async def health_check(request):
+    """Simple health check endpoint"""
+    return web.Response(text="OK", status=200)
+
+async def start_webserver():
+    """Start simple web server on port 4853"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/status', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', 4853)
+    await site.start()
+    print(f"✅ Web server running on http://0.0.0.0:4853")
 
 # ======================== RUN BOT ========================
 if __name__ == "__main__":
