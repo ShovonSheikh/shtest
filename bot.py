@@ -16,11 +16,12 @@ import json
 import sys
 from aiohttp import web
 import threading
+import shlex
 
 # ======================== CONFIGURATION ========================
-# Hardcoded for testing - move to .env for production
+# Load secrets from environment variables. Do NOT keep secrets in source.
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-JSONBIN_API_KEY = os.getenv('JSONBIN_API_KEY')  # Get from jsonbin.io
+JSONBIN_API_KEY = os.getenv('JSONBIN_API_KEY')
 JSONBIN_BIN_ID = os.getenv('JSONBIN_BIN_ID')
 
 # ======================== JSONBIN STORAGE ========================
@@ -33,23 +34,31 @@ class JSONBinStorage:
             "X-Master-Key": api_key,
             "Content-Type": "application/json"
         }
-    
-    def get_users(self):
-        """Fetch user data from JSONBin"""
-        try:
-            response = requests.get(f"{self.base_url}/latest", headers=self.headers)
-            if response.status_code == 200:
-                return response.json().get('record', {})
+    async def get_users(self):
+        """Fetch user data from JSONBin (async)"""
+        if not self.api_key or not self.bin_id:
             return {}
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{self.base_url}/latest", headers=self.headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return data.get('record', {})
+                    return {}
         except Exception as e:
             print(f"Error fetching users: {e}")
             return {}
-    
-    def save_users(self, users_data):
-        """Save user data to JSONBin"""
+
+    async def save_users(self, users_data):
+        """Save user data to JSONBin (async)"""
+        if not self.api_key or not self.bin_id:
+            return False
+
         try:
-            response = requests.put(self.base_url, json=users_data, headers=self.headers)
-            return response.status_code == 200
+            async with aiohttp.ClientSession() as session:
+                async with session.put(self.base_url, json=users_data, headers=self.headers) as resp:
+                    return resp.status == 200
         except Exception as e:
             print(f"Error saving users: {e}")
             return False
@@ -60,14 +69,22 @@ class RBACSystem:
     
     def __init__(self, storage):
         self.storage = storage
-        self.users = self.storage.get_users()
-        
-        # Initialize with empty structure if needed
-        if not self.users:
-            self.users = {'admins': [], 'users': [], 'readonly': []}
-            self.storage.save_users(self.users)
+        # Start with a default in-memory structure; load persisted data asynchronously
+        self.users = {'admins': [], 'users': [], 'readonly': []}
+
+    async def load_users(self):
+        """Load users from storage asynchronously and initialize defaults if needed."""
+        try:
+            users = await self.storage.get_users()
+            if users:
+                self.users = users
+            else:
+                # Ensure structure exists in storage
+                await self.storage.save_users(self.users)
+        except Exception as e:
+            print(f"Error loading RBAC users: {e}")
     
-    def add_user(self, user_id: int, role: str):
+    async def add_user(self, user_id: int, role: str):
         """Add user with specific role"""
         user_id = str(user_id)
         role = role.lower()
@@ -88,11 +105,11 @@ class RBACSystem:
         
         if user_id not in self.users[key]:
             self.users[key].append(user_id)
-            self.storage.save_users(self.users)
-        
+            await self.storage.save_users(self.users)
+
         return True
     
-    def remove_user(self, user_id: int):
+    async def remove_user(self, user_id: int):
         """Remove user from all roles"""
         user_id = str(user_id)
         removed = False
@@ -104,8 +121,8 @@ class RBACSystem:
                 removed = True
         
         if removed:
-            self.storage.save_users(self.users)
-        
+            await self.storage.save_users(self.users)
+
         return removed
     
     def get_role(self, user_id: int):
@@ -152,7 +169,16 @@ async def send_error(ctx, error_msg):
     """Send error to both Discord and terminal"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] ERROR: {error_msg}")
-    await ctx.response.send_message(f"❌ **Error:**\n```\n{error_msg}\n```", ephemeral=True)
+    # Try primary response; if the interaction was deferred or responded to already,
+    # fall back to followup. This prevents runtime errors after `defer()`.
+    try:
+        await ctx.response.send_message(f"❌ **Error:**\n```\n{error_msg}\n```", ephemeral=True)
+    except Exception:
+        try:
+            await ctx.followup.send(f"❌ **Error:**\n```\n{error_msg}\n```", ephemeral=True)
+        except Exception:
+            # Give up gracefully but keep the error visible in logs
+            print("Failed to send error to Discord interaction.")
 
 # ======================== PERMISSION DECORATOR ========================
 def requires_permission(role='readonly'):
@@ -174,11 +200,18 @@ def requires_permission(role='readonly'):
 @bot.event
 async def on_ready():
     print(f'✅ Bot logged in as {bot.user}')
-    print(f'📊 Loaded {len(rbac.users)} user records')
-    
+    print(f'📊 RBAC in-memory records: {len(rbac.users)}')
+
     # Start web server
     asyncio.create_task(start_webserver())
-    
+
+    # Load persisted RBAC users asynchronously
+    try:
+        await rbac.load_users()
+        print(f'📊 Loaded {len(rbac.users)} user records from storage')
+    except Exception as e:
+        print(f'⚠️ Failed to load RBAC users: {e}')
+
     try:
         synced = await bot.tree.sync()
         print(f'✅ Synced {len(synced)} commands')
@@ -219,8 +252,7 @@ async def admin_cmd(interaction: discord.Interaction, action: str, user: Optiona
         if not user or not role:
             await interaction.response.send_message("❌ Please specify user and role", ephemeral=True)
             return
-        
-        if rbac.add_user(user.id, role):
+        if await rbac.add_user(user.id, role):
             await interaction.response.send_message(f"✅ Added {user.mention} as **{role}**")
             log_command(str(interaction.user), f"admin add {user.name} as {role}", "SUCCESS")
         else:
@@ -230,8 +262,7 @@ async def admin_cmd(interaction: discord.Interaction, action: str, user: Optiona
         if not user:
             await interaction.response.send_message("❌ Please specify user", ephemeral=True)
             return
-        
-        if rbac.remove_user(user.id):
+        if await rbac.remove_user(user.id):
             await interaction.response.send_message(f"✅ Removed {user.mention} from all roles")
             log_command(str(interaction.user), f"admin remove {user.name}", "SUCCESS")
         else:
@@ -368,16 +399,18 @@ async def download_cmd(interaction: discord.Interaction, filepath: str):
         return
     
     try:
+        await interaction.response.defer()
+
         if not os.path.isfile(filepath):
-            await interaction.response.send_message(f"❌ File not found: {filepath}", ephemeral=True)
+            await interaction.followup.send(f"❌ File not found: {filepath}", ephemeral=True)
             return
-        
+
         file_size = os.path.getsize(filepath)
         if file_size > 25_000_000:  # 25MB Discord limit
-            await interaction.response.send_message(f"❌ File too large ({file_size / 1_000_000:.1f}MB). Use /zip for large files.", ephemeral=True)
+            await interaction.followup.send(f"❌ File too large ({file_size / 1_000_000:.1f}MB). Use /zip for large files.", ephemeral=True)
             return
-        
-        await interaction.response.send_message(f"📥 Uploading `{filepath}`...")
+
+        await interaction.followup.send(f"📥 Uploading `{filepath}`...")
         await interaction.followup.send(file=discord.File(filepath))
         log_command(str(interaction.user), f"download {filepath}", "SUCCESS")
     except Exception as e:
@@ -393,26 +426,30 @@ async def zip_cmd(interaction: discord.Interaction, path: str, zipname: str = "a
     
     try:
         await interaction.response.defer()
-        
+
         if not os.path.exists(path):
             await interaction.followup.send(f"❌ Path not found: {path}")
             return
-        
-        with zipfile.ZipFile(zipname, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            if os.path.isfile(path):
-                zipf.write(path, os.path.basename(path))
-            else:
-                for root, dirs, files in os.walk(path):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        zipf.write(file_path, os.path.relpath(file_path, path))
-        
+
+        def _create_zip(pth, zname):
+            with zipfile.ZipFile(zname, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                if os.path.isfile(pth):
+                    zipf.write(pth, os.path.basename(pth))
+                else:
+                    for root, dirs, files in os.walk(pth):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            zipf.write(file_path, os.path.relpath(file_path, pth))
+
+        # Offload zipping to a thread to avoid blocking the event loop
+        await asyncio.to_thread(_create_zip, path, zipname)
+
         file_size = os.path.getsize(zipname)
         if file_size > 25_000_000:
             os.remove(zipname)
             await interaction.followup.send(f"❌ Zip too large ({file_size / 1_000_000:.1f}MB)")
             return
-        
+
         await interaction.followup.send(f"📦 **Zipped: `{path}`**", file=discord.File(zipname))
         os.remove(zipname)
         log_command(str(interaction.user), f"zip {path}", "SUCCESS")
@@ -474,22 +511,27 @@ async def sh_cmd(interaction: discord.Interaction, command: str):
         return
     
     try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        output = result.stdout + result.stderr
+        await interaction.response.defer()
+
+        # Safer execution: use shlex.split and exec the command directly
+        args = shlex.split(command)
+        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await interaction.followup.send("❌ Command timed out (30s limit)", ephemeral=True)
+            log_command(str(interaction.user), f"sh {command}", "TIMEOUT")
+            return
+
+        output = (stdout.decode() if stdout else '') + (stderr.decode() if stderr else '')
         if not output:
             output = "✅ Command executed (no output)"
-        
+
         if len(output) > 1900:
             output = output[:1900] + "\n... (truncated)"
-        
-        await interaction.response.send_message(f"```bash\n$ {command}\n\n{output}\n```")
+
+        await interaction.followup.send(f"```bash\n$ {command}\n\n{output}\n```")
         log_command(str(interaction.user), f"sh {command}", "SUCCESS")
     except subprocess.TimeoutExpired:
         await send_error(interaction, "Command timed out (30s limit)")
@@ -506,21 +548,26 @@ async def cmd_cmd(interaction: discord.Interaction, command: str):
         return
     
     try:
-        result = subprocess.run(
-            command.split(),
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        
-        output = result.stdout + result.stderr
+        await interaction.response.defer()
+
+        args = shlex.split(command)
+        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await interaction.followup.send("❌ Command timed out (30s limit)", ephemeral=True)
+            log_command(str(interaction.user), f"cmd {command}", "TIMEOUT")
+            return
+
+        output = (stdout.decode() if stdout else '') + (stderr.decode() if stderr else '')
         if not output:
             output = "✅ Command executed (no output)"
-        
+
         if len(output) > 1900:
             output = output[:1900] + "\n... (truncated)"
-        
-        await interaction.response.send_message(f"```\n$ {command}\n\n{output}\n```")
+
+        await interaction.followup.send(f"```\n$ {command}\n\n{output}\n```")
         log_command(str(interaction.user), f"cmd {command}", "SUCCESS")
     except subprocess.TimeoutExpired:
         await send_error(interaction, "Command timed out (30s limit)")
@@ -537,32 +584,29 @@ async def python_cmd(interaction: discord.Interaction, code: str):
         return
     
     try:
-        # Check if it's a file path
+        await interaction.response.defer()
+
         if code.endswith('.py') and os.path.isfile(code):
-            result = subprocess.run(
-                [sys.executable, code],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            output = result.stdout + result.stderr
+            proc = await asyncio.create_subprocess_exec(sys.executable, code, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         else:
-            # Execute as code
-            result = subprocess.run(
-                [sys.executable, '-c', code],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            output = result.stdout + result.stderr
-        
+            proc = await asyncio.create_subprocess_exec(sys.executable, '-c', code, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await interaction.followup.send("❌ Execution timed out (30s limit)", ephemeral=True)
+            log_command(str(interaction.user), f"python", "TIMEOUT")
+            return
+
+        output = (stdout.decode() if stdout else '') + (stderr.decode() if stderr else '')
         if not output:
             output = "✅ Executed (no output)"
-        
+
         if len(output) > 1900:
             output = output[:1900] + "\n... (truncated)"
-        
-        await interaction.response.send_message(f"```python\n{output}\n```")
+
+        await interaction.followup.send(f"```python\n{output}\n```")
         log_command(str(interaction.user), f"python", "SUCCESS")
     except subprocess.TimeoutExpired:
         await send_error(interaction, "Execution timed out (30s limit)")
@@ -581,20 +625,23 @@ async def ping_cmd(interaction: discord.Interaction, target: str = "8.8.8.8"):
     try:
         # Detect OS and use appropriate ping command
         param = '-n' if platform.system().lower() == 'windows' else '-c'
-        command = ['ping', param, '4', target]
-        
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        output = result.stdout
+        args = ['ping', param, '4', target]
+
+        await interaction.response.defer()
+        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await interaction.followup.send("❌ Ping timed out", ephemeral=True)
+            log_command(str(interaction.user), f"ping {target}", "TIMEOUT")
+            return
+
+        output = stdout.decode() if stdout else ''
         if len(output) > 1900:
             output = output[:1900] + "\n... (truncated)"
-        
-        await interaction.response.send_message(f"🏓 **Ping to `{target}`:**\n```\n{output}\n```")
+
+        await interaction.followup.send(f"🏓 **Ping to `{target}`:**\n```\n{output}\n```")
         log_command(str(interaction.user), f"ping {target}", "SUCCESS")
     except subprocess.TimeoutExpired:
         await send_error(interaction, "Ping timed out")
