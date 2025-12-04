@@ -17,12 +17,22 @@ import sys
 from aiohttp import web
 import threading
 import shlex
+import signal
 
 # ======================== CONFIGURATION ========================
 # Load secrets from environment variables. Do NOT keep secrets in source.
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 JSONBIN_API_KEY = os.getenv('JSONBIN_API_KEY')
 JSONBIN_BIN_ID = os.getenv('JSONBIN_BIN_ID')
+
+# ======================== PROCESS TRACKING ========================
+active_processes = {}
+process_counter = 0
+
+def get_next_process_id():
+    global process_counter
+    process_counter += 1
+    return process_counter
 
 # ======================== JSONBIN STORAGE ========================
 class JSONBinStorage:
@@ -180,6 +190,136 @@ async def send_error(ctx, error_msg):
             # Give up gracefully but keep the error visible in logs
             print("Failed to send error to Discord interaction.")
 
+# ======================== STREAMING COMMAND EXECUTOR ========================
+async def stream_command_output(interaction: discord.Interaction, args: list, command_str: str, shell_type: str = "bash"):
+    """
+    Execute a command and stream its output in real-time by editing the Discord message.
+    
+    Args:
+        interaction: Discord interaction object
+        args: Command arguments list (for subprocess)
+        command_str: Original command string (for display)
+        shell_type: Type of shell for formatting ("bash", "python", or "plain")
+    """
+    proc_id = get_next_process_id()
+    start_time = datetime.now()
+    
+    try:
+        # Start the process
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        # Track the process
+        active_processes[proc_id] = {
+            'proc': proc,
+            'command': command_str,
+            'user': interaction.user,
+            'start_time': start_time,
+            'interaction': interaction
+        }
+        
+        output_buffer = ""
+        last_update = datetime.now()
+        update_interval = 0.5  # Update every 0.5 seconds
+        
+        # Send initial message
+        shell_format = shell_type if shell_type in ["bash", "python"] else ""
+        initial_msg = f"🔄 **Running...** (Process #{proc_id})\n\n```{shell_format}\n$ {command_str}\n\n```"
+        message = await interaction.followup.send(initial_msg)
+        
+        async def read_stream(stream, prefix=""):
+            """Read from stream and return output"""
+            nonlocal output_buffer
+            try:
+                while True:
+                    line = await stream.readline()
+                    if not line:
+                        break
+                    decoded = line.decode('utf-8', errors='replace')
+                    output_buffer += prefix + decoded
+            except Exception as e:
+                output_buffer += f"\n[Stream error: {e}]"
+        
+        # Create tasks to read both stdout and stderr
+        stdout_task = asyncio.create_task(read_stream(proc.stdout))
+        stderr_task = asyncio.create_task(read_stream(proc.stderr, ""))
+        
+        # Monitor the process and update message
+        while proc.returncode is None:
+            # Check if process is still running
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
+            
+            # Update message periodically
+            now = datetime.now()
+            if (now - last_update).total_seconds() >= update_interval:
+                elapsed = (now - start_time).total_seconds()
+                
+                # Prepare output (truncate if too long)
+                display_output = output_buffer
+                if len(display_output) > 1800:
+                    # Show last 1800 chars
+                    display_output = "... (truncated)\n" + display_output[-1800:]
+                
+                status_msg = f"🔄 **Running...** (Process #{proc_id} | {elapsed:.1f}s)\n\n```{shell_format}\n$ {command_str}\n\n{display_output}```"
+                
+                try:
+                    await message.edit(content=status_msg)
+                    last_update = now
+                except discord.errors.HTTPException:
+                    # Rate limit or other issue, skip this update
+                    pass
+            
+            await asyncio.sleep(0.1)
+        
+        # Wait for stream reading to complete
+        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        
+        # Process completed - send final message
+        elapsed = (datetime.now() - start_time).total_seconds()
+        
+        if not output_buffer:
+            output_buffer = "(no output)"
+        
+        # Prepare final output
+        final_output = output_buffer
+        if len(final_output) > 1800:
+            final_output = "... (truncated)\n" + final_output[-1800:]
+        
+        if proc.returncode == 0:
+            status_icon = "✅"
+            status_text = "Completed"
+        else:
+            status_icon = "❌"
+            status_text = f"Failed (exit code: {proc.returncode})"
+        
+        final_msg = f"{status_icon} **{status_text}** (Process #{proc_id} | {elapsed:.1f}s)\n\n```{shell_format}\n$ {command_str}\n\n{final_output}```"
+        
+        try:
+            await message.edit(content=final_msg)
+        except discord.errors.HTTPException:
+            # If edit fails, send new message
+            await interaction.followup.send(final_msg)
+        
+        return proc.returncode
+        
+    except Exception as e:
+        error_msg = f"❌ **Execution Error** (Process #{proc_id})\n```\n{str(e)}\n```"
+        try:
+            await interaction.followup.send(error_msg)
+        except:
+            pass
+        return -1
+    finally:
+        # Clean up process tracking
+        if proc_id in active_processes:
+            del active_processes[proc_id]
+
 # ======================== PERMISSION DECORATOR ========================
 def requires_permission(role='readonly'):
     def decorator(func):
@@ -267,6 +407,108 @@ async def admin_cmd(interaction: discord.Interaction, action: str, user: Optiona
             log_command(str(interaction.user), f"admin remove {user.name}", "SUCCESS")
         else:
             await interaction.response.send_message(f"❌ User not found", ephemeral=True)
+
+# ======================== PROCESS CONTROL COMMANDS ========================
+@bot.tree.command(name="ps", description="List active processes")
+async def ps_cmd(interaction: discord.Interaction):
+    if not rbac.has_permission(interaction.user.id, 'readonly'):
+        await interaction.response.send_message("❌ Access denied", ephemeral=True)
+        return
+    
+    if not active_processes:
+        await interaction.response.send_message("📋 No active processes", ephemeral=True)
+        return
+    
+    embed = discord.Embed(title="📋 Active Processes", color=discord.Color.blue())
+    
+    for proc_id, proc_info in active_processes.items():
+        elapsed = (datetime.now() - proc_info['start_time']).total_seconds()
+        user_mention = proc_info['user'].mention
+        command = proc_info['command']
+        
+        # Truncate long commands
+        if len(command) > 50:
+            command = command[:47] + "..."
+        
+        field_value = f"**User:** {user_mention}\n**Command:** `{command}`\n**Runtime:** {elapsed:.1f}s\n**Control:** `/stop {proc_id}` or `/kill {proc_id}`"
+        
+        embed.add_field(
+            name=f"🔹 Process #{proc_id}",
+            value=field_value,
+            inline=False
+        )
+    
+    await interaction.response.send_message(embed=embed)
+    log_command(str(interaction.user), "ps", "SUCCESS")
+
+@bot.tree.command(name="stop", description="Stop a running process (SIGTERM)")
+@app_commands.describe(process_id="Process ID to stop")
+async def stop_cmd(interaction: discord.Interaction, process_id: int):
+    if not rbac.has_permission(interaction.user.id, 'user'):
+        await interaction.response.send_message("❌ Access denied", ephemeral=True)
+        return
+    
+    if process_id not in active_processes:
+        await interaction.response.send_message(f"❌ Process #{process_id} not found", ephemeral=True)
+        return
+    
+    proc_info = active_processes[process_id]
+    
+    # Check if user owns the process or is admin
+    is_admin = rbac.has_permission(interaction.user.id, 'admin')
+    is_owner = proc_info['user'].id == interaction.user.id
+    
+    if not (is_admin or is_owner):
+        await interaction.response.send_message("❌ You can only stop your own processes", ephemeral=True)
+        return
+    
+    try:
+        proc = proc_info['proc']
+        
+        # Send SIGTERM for graceful shutdown
+        if platform.system() == "Windows":
+            proc.terminate()
+        else:
+            proc.send_signal(signal.SIGTERM)
+        
+        await interaction.response.send_message(f"✅ Sent stop signal (SIGTERM) to process #{process_id}")
+        log_command(str(interaction.user), f"stop {process_id}", "SUCCESS")
+    except Exception as e:
+        await send_error(interaction, f"Failed to stop process: {str(e)}")
+        log_command(str(interaction.user), f"stop {process_id}", "FAILED")
+
+@bot.tree.command(name="kill", description="Force kill a process (SIGKILL)")
+@app_commands.describe(process_id="Process ID to kill")
+async def kill_cmd(interaction: discord.Interaction, process_id: int):
+    if not rbac.has_permission(interaction.user.id, 'user'):
+        await interaction.response.send_message("❌ Access denied", ephemeral=True)
+        return
+    
+    if process_id not in active_processes:
+        await interaction.response.send_message(f"❌ Process #{process_id} not found", ephemeral=True)
+        return
+    
+    proc_info = active_processes[process_id]
+    
+    # Check if user owns the process or is admin
+    is_admin = rbac.has_permission(interaction.user.id, 'admin')
+    is_owner = proc_info['user'].id == interaction.user.id
+    
+    if not (is_admin or is_owner):
+        await interaction.response.send_message("❌ You can only kill your own processes", ephemeral=True)
+        return
+    
+    try:
+        proc = proc_info['proc']
+        
+        # Send SIGKILL for immediate termination
+        proc.kill()
+        
+        await interaction.response.send_message(f"✅ Force killed process #{process_id}")
+        log_command(str(interaction.user), f"kill {process_id}", "SUCCESS")
+    except Exception as e:
+        await send_error(interaction, f"Failed to kill process: {str(e)}")
+        log_command(str(interaction.user), f"kill {process_id}", "FAILED")
 
 # ======================== FILE SYSTEM COMMANDS ========================
 @bot.tree.command(name="ls", description="List directory contents")
@@ -502,8 +744,8 @@ async def get_cmd(interaction: discord.Interaction, url: str, filename: Optional
         await interaction.followup.send(f"❌ Error: {str(e)}")
         log_command(str(interaction.user), f"get {url}", "FAILED")
 
-# ======================== SYSTEM COMMANDS ========================
-@bot.tree.command(name="sh", description="Execute bash command")
+# ======================== SYSTEM COMMANDS WITH STREAMING ========================
+@bot.tree.command(name="sh", description="Execute bash command with real-time output")
 @app_commands.describe(command="Bash command to execute")
 async def sh_cmd(interaction: discord.Interaction, command: str):
     if not rbac.has_permission(interaction.user.id, 'user'):
@@ -512,35 +754,14 @@ async def sh_cmd(interaction: discord.Interaction, command: str):
     
     try:
         await interaction.response.defer()
-
-        # Safer execution: use shlex.split and exec the command directly
         args = shlex.split(command)
-        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await interaction.followup.send("❌ Command timed out (30s limit)", ephemeral=True)
-            log_command(str(interaction.user), f"sh {command}", "TIMEOUT")
-            return
-
-        output = (stdout.decode() if stdout else '') + (stderr.decode() if stderr else '')
-        if not output:
-            output = "✅ Command executed (no output)"
-
-        if len(output) > 1900:
-            output = output[:1900] + "\n... (truncated)"
-
-        await interaction.followup.send(f"```bash\n$ {command}\n\n{output}\n```")
+        await stream_command_output(interaction, args, command, "bash")
         log_command(str(interaction.user), f"sh {command}", "SUCCESS")
-    except subprocess.TimeoutExpired:
-        await send_error(interaction, "Command timed out (30s limit)")
-        log_command(str(interaction.user), f"sh {command}", "TIMEOUT")
     except Exception as e:
         await send_error(interaction, str(e))
         log_command(str(interaction.user), f"sh {command}", "FAILED")
 
-@bot.tree.command(name="cmd", description="Execute any system command")
+@bot.tree.command(name="cmd", description="Execute system command with real-time output")
 @app_commands.describe(command="Command to execute")
 async def cmd_cmd(interaction: discord.Interaction, command: str):
     if not rbac.has_permission(interaction.user.id, 'user'):
@@ -549,34 +770,14 @@ async def cmd_cmd(interaction: discord.Interaction, command: str):
     
     try:
         await interaction.response.defer()
-
         args = shlex.split(command)
-        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await interaction.followup.send("❌ Command timed out (30s limit)", ephemeral=True)
-            log_command(str(interaction.user), f"cmd {command}", "TIMEOUT")
-            return
-
-        output = (stdout.decode() if stdout else '') + (stderr.decode() if stderr else '')
-        if not output:
-            output = "✅ Command executed (no output)"
-
-        if len(output) > 1900:
-            output = output[:1900] + "\n... (truncated)"
-
-        await interaction.followup.send(f"```\n$ {command}\n\n{output}\n```")
+        await stream_command_output(interaction, args, command, "plain")
         log_command(str(interaction.user), f"cmd {command}", "SUCCESS")
-    except subprocess.TimeoutExpired:
-        await send_error(interaction, "Command timed out (30s limit)")
-        log_command(str(interaction.user), f"cmd {command}", "TIMEOUT")
     except Exception as e:
         await send_error(interaction, str(e))
         log_command(str(interaction.user), f"cmd {command}", "FAILED")
 
-@bot.tree.command(name="python", description="Execute Python code or run Python file")
+@bot.tree.command(name="python", description="Execute Python code or file with real-time output")
 @app_commands.describe(code="Python code to execute or path to .py file")
 async def python_cmd(interaction: discord.Interaction, code: str):
     if not rbac.has_permission(interaction.user.id, 'user'):
@@ -585,32 +786,16 @@ async def python_cmd(interaction: discord.Interaction, code: str):
     
     try:
         await interaction.response.defer()
-
+        
         if code.endswith('.py') and os.path.isfile(code):
-            proc = await asyncio.create_subprocess_exec(sys.executable, code, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            args = [sys.executable, code]
+            display_cmd = f"python {code}"
         else:
-            proc = await asyncio.create_subprocess_exec(sys.executable, '-c', code, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-
-        try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await interaction.followup.send("❌ Execution timed out (30s limit)", ephemeral=True)
-            log_command(str(interaction.user), f"python", "TIMEOUT")
-            return
-
-        output = (stdout.decode() if stdout else '') + (stderr.decode() if stderr else '')
-        if not output:
-            output = "✅ Executed (no output)"
-
-        if len(output) > 1900:
-            output = output[:1900] + "\n... (truncated)"
-
-        await interaction.followup.send(f"```python\n{output}\n```")
+            args = [sys.executable, '-c', code]
+            display_cmd = code
+        
+        await stream_command_output(interaction, args, display_cmd, "python")
         log_command(str(interaction.user), f"python", "SUCCESS")
-    except subprocess.TimeoutExpired:
-        await send_error(interaction, "Execution timed out (30s limit)")
-        log_command(str(interaction.user), f"python", "TIMEOUT")
     except Exception as e:
         await send_error(interaction, str(e))
         log_command(str(interaction.user), f"python", "FAILED")
@@ -618,7 +803,9 @@ async def python_cmd(interaction: discord.Interaction, code: str):
 @bot.tree.command(name="ping", description="Check site latency via HTTP")
 @app_commands.describe(target="URL to check (e.g., google.com)")
 async def ping_cmd(interaction: discord.Interaction, target: str = "google.com"):
-    # ... (Permission check code from your bot.py) ...
+    if not rbac.has_permission(interaction.user.id, 'readonly'):
+        await interaction.response.send_message("❌ Access denied", ephemeral=True)
+        return
     
     if not target.startswith("http"):
         target = f"http://{target}"
@@ -630,8 +817,10 @@ async def ping_cmd(interaction: discord.Interaction, target: str = "google.com")
             async with session.get(target, timeout=5) as resp:
                 latency = (datetime.now() - start).total_seconds() * 1000
                 await interaction.followup.send(f"🏓 **Pong!**\nSite: `{target}`\nStatus: `{resp.status}`\nLatency: `{latency:.0f}ms`")
+        log_command(str(interaction.user), f"ping {target}", "SUCCESS")
     except Exception as e:
         await interaction.followup.send(f"❌ Could not reach `{target}`: {str(e)}")
+        log_command(str(interaction.user), f"ping {target}", "FAILED")
 
 @bot.tree.command(name="disk", description="Show disk usage")
 async def disk_cmd(interaction: discord.Interaction):
