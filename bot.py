@@ -19,6 +19,25 @@ import threading
 import shlex
 import signal
 
+# ======================== RENDER CONFIGURATION ========================
+# Render provides PORT environment variable dynamically
+PORT = int(os.getenv('PORT', 4853))
+
+# Then update the start_webserver function (around line 730):
+
+async def start_webserver():
+    """Start simple web server on port specified by PORT env variable"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/status', health_check)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    print(f"✅ Web server running on http://0.0.0.0:{PORT}")
+
 # ======================== CONFIGURATION ========================
 # Load secrets from environment variables. Do NOT keep secrets in source.
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
